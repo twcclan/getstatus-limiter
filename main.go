@@ -11,21 +11,21 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcap"
 	"github.com/hashicorp/golang-lru"
-	"github.com/juju/ratelimit"
+	"golang.org/x/time/rate"
 )
 
 const (
 	// how many packets per second clients are allowed to send on average
-	packetsPerSecond = 50
+	packetsPerSecond = 100
 
 	// the number of packets a single client may send at most per second
-	burst = 1000
+	burst = 3000
 )
 
 var (
 	// this is a lru cache used to hold the token buckets
 	// that are used for rate limiting
-	cache, _ = lru.New(1024)
+	cache, _ = lru.New(10240)
 
 	// a map that holds all IP addresses that were banned already
 	// used to prevent double-banning an IP
@@ -35,6 +35,12 @@ var (
 	// this map holds all local ipv4 addresses
 	locals = make(map[string]bool)
 )
+
+type remote struct {
+	limiter *rate.Limiter
+	first   time.Time
+	total   uint64
+}
 
 // store all local ipv4 addresses
 func getLocalAddresses() {
@@ -61,18 +67,20 @@ func getLocalAddresses() {
 }
 
 // retrieve a token bucket from the cache, keyed by ip address
-func getRateLimit(key string) *ratelimit.Bucket {
-
-	// get or create the token bucket for this ip address
-	cache.ContainsOrAdd(key, ratelimit.NewBucketWithQuantum(time.Second, burst, packetsPerSecond))
-
+func getRemote(key string) *remote {
 	if bkt, ok := cache.Get(key); ok {
-		return bkt.(*ratelimit.Bucket)
-	}
+		return bkt.(*remote)
+	} else {
+		r := &remote{
+			limiter: rate.NewLimiter(packetsPerSecond, burst),
+			first:   time.Now(),
+			total:   0,
+		}
 
-	// if for some reasons the bucket gets evicted between adding and reading
-	// just try again ...
-	return getRateLimit(key)
+		cache.Add(key, r)
+
+		return r
+	}
 }
 
 // handle a network packet
@@ -85,14 +93,14 @@ func handlePacket(p gopacket.Packet) {
 	// check if we need to count packets
 	if !locals[dst] && !offenders[dst] {
 		//log.Printf("%s -> %s", flow.Src(), flow.Dst())
-		bkt := getRateLimit(dst)
-		tokens := bkt.TakeAvailable(1)
+		r := getRemote(dst)
+		r.total++
 
 		// if all tokens are used, ban the ip address
 		// because it's most likely trying to abuse our bandwidth
-		if tokens == 0 {
+		if !r.limiter.Allow() {
 			offenders[dst] = true
-			log.Printf("Offender %s", dst)
+			log.Printf("Offender %s, %d packets over %v", dst, r.total, time.Since(r.first))
 			output, err := exec.Command("iptables", "-A", "INPUT", "-s", dst, "-j", "DROP").CombinedOutput()
 			if err != nil {
 				log.Printf("Failed banning IP: %s %s %s", dst, err.Error(), string(output))
